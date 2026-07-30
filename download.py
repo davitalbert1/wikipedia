@@ -1,16 +1,13 @@
 import os
 from pathlib import Path
 from urllib.parse import urljoin
-
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-# Pode adicionar quantas URLs quiser
 BASE_URLS = [
     "https://dumps.wikimedia.org/other/mediawiki_content_current/enwiki/2026-07-01/xml/bzip2/",
     # "https://dumps.wikimedia.org/other/mediawiki_content_current/ptwiki/2026-07-01/xml/bzip2/",
-    # "https://dumps.wikimedia.org/other/mediawiki_content_current/dewiki/2026-07-01/xml/bzip2/",
 ]
 
 CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -20,20 +17,13 @@ HEADERS = {
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-
 def get_language(url: str) -> str:
-    """
-    https://.../mediawiki_content_current/enwiki/2026-07-01/xml/bzip2/
-                                         ^^^^^^
-    """
     parts = url.rstrip("/").split("/")
     idx = parts.index("mediawiki_content_current")
     return parts[idx + 1]
 
-
 def limpar_temp(destino: Path):
-    if not destino.exists():
-        return
+    if not destino.exists(): return
 
     for arq in destino.glob("*.temp"):
         try:
@@ -42,21 +32,15 @@ def limpar_temp(destino: Path):
         except Exception as e:
             print(f"Erro removendo {arq}: {e}")
 
-
 def listar_arquivos(base_url: str):
     r = requests.get(base_url, headers=HEADERS, timeout=60)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    arquivos = sorted(
-        a["href"]
-        for a in soup.find_all("a", href=True)
-        if a["href"].endswith(".xml.bz2")
-    )
+    arquivos = sorted(a["href"] for a in soup.find_all("a", href=True) if a["href"].endswith(".xml.bz2"))
 
     return arquivos
-
 
 def baixar(base_url: str, destino: Path, nome: str):
     final = destino / nome
@@ -81,16 +65,13 @@ def baixar(base_url: str, destino: Path, nome: str):
             desc=nome,
             leave=True,
         ) as pbar:
-
             for chunk in r.iter_content(CHUNK_SIZE):
-                if not chunk:
-                    continue
+                if not chunk: continue
 
                 f.write(chunk)
                 pbar.update(len(chunk))
 
     temp.rename(final)
-
 
 def processar(base_url: str):
     language = get_language(base_url)
@@ -106,14 +87,10 @@ def processar(base_url: str):
 
     print(f"{len(arquivos)} arquivos encontrados.\n")
 
-    for nome in arquivos:
-        baixar(base_url, destino, nome)
-
+    for nome in arquivos: baixar(base_url, destino, nome)
 
 def main():
-    for url in BASE_URLS:
-        processar(url)
-
+    for url in BASE_URLS: processar(url)
 
 if __name__ == "__main__":
     main()

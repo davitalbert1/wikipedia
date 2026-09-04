@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from urllib.parse import urljoin
 import requests
@@ -76,7 +75,7 @@ def baixar(base_url: str, destino: Path, nome: str):
 def processar(base_url: str):
     language = get_language(base_url)
 
-    destino = Path("dump") / language
+    destino = Path(r"E:\wikipedia\dump") / language
     destino.mkdir(parents=True, exist_ok=True)
 
     print(f"\n=== {language} ===")

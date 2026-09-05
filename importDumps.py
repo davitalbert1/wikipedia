@@ -11,8 +11,8 @@ except ImportError:
     from xml.etree.ElementTree import iterparse
     HAVE_LXML = False
 
-PASTA_DUMPS = Path(r"F:\wikipedia\dump") # pasta com os .xml.bz2
-DB_PATH = Path(r"F:\wikipedia\wikipedia.db") # destino do .db
+PASTA_DUMPS = Path(r"D:\dump") # pasta com os .xml.bz2
+DB_PATH = Path(r"G:\wikipedia\wikipedia.db") # destino do .db
 BATCH_SIZE = 2000  # páginas por lote de inserção
 
 # formatação leve de wikitexto para texto legível
@@ -56,9 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_paginas_data ON paginas(data);
 -- ultimo_page_id: maior page_id CONFIRMADO no banco, salvo na MESMA
 -- transação do lote correspondente (nunca antes do COMMIT).
 CREATE TABLE IF NOT EXISTS progresso (
-    arquivo TEXT PRIMARY KEY,  -- nome do .bz2
+    arquivo TEXT PRIMARY KEY, -- nome do .bz2
     completo INTEGER NOT NULL DEFAULT 0, -- 1 = importado até o fim
-    ultimo_page_id INTEGER NOT NULL DEFAULT 0   -- checkpoint de retomada
+    ultimo_page_id INTEGER NOT NULL DEFAULT 0 -- checkpoint de retomada
 ) WITHOUT ROWID;
 """
 
@@ -86,10 +86,15 @@ def paginas_do_dump(arquivo: Path):
     P = tag_page[:-4] if tag_page.startswith("{") else ""
     try:
         with bz2.open(arquivo, "rb") as fb:
-            if HAVE_LXML: contexto = iterparse(fb, events=("end",), tags=(tag_page,))
-            else: contexto = iterparse(fb, events=("end",))
+            # lxml usa 'tag' (singular); 'tags' não existe e causa TypeError.
+            # Só filtra se o namespace foi detectado; senão, parseia tudo
+            # e confia no filtro por localname abaixo.
+            if HAVE_LXML and P:
+                contexto = iterparse(fb, events=("end",), tag=tag_page)
+            else:
+                contexto = iterparse(fb, events=("end",))
             for _, elem in contexto:
-                if HAVE_LXML or localname(elem.tag) == "page":
+                if (HAVE_LXML and P) or localname(elem.tag) == "page":
                     pid = int((elem.findtext(P + "id") or 0))
                     titulo = elem.findtext(P + "title") or ""
                     ns = int(elem.findtext(P + "ns") or 0)
@@ -98,6 +103,11 @@ def paginas_do_dump(arquivo: Path):
                     if pid and texto.strip():
                         yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, formatar_texto(texto)
                     elem.clear()
+                    if HAVE_LXML:
+                        # Libera os irmãos anteriores já processados para não
+                        # acumular milhões de elementos vazios em dumps gigantes.
+                        while elem.getprevious() is not None:
+                            del elem.getparent()[0]
     except (OSError, EOFError):
         # Erro de descompressão BZ2 / EOF inesperado = arquivo truncado ou corrompido.
         raise
@@ -132,7 +142,7 @@ def main():
         total_db = cur.execute("SELECT COUNT(*) FROM paginas").fetchone()[0]
         pct = (indice - 1) / total_dumps * 100
         vel = processadas / max(time.time() - inicio, 1e-9)
-        
+
         # ANSI para limpar linhas
         texto_limpo = f"\r[{indice}/{total_dumps} dumps | {pct:5.1f}%] {nome_atual}:"
         if not is_final:
@@ -195,9 +205,9 @@ def main():
                 conn.execute("BEGIN")
 
                 # Move o cursor de terminal para baixo das 4 linhas do progresso
-                if processadas > 0: sys.stdout.write("\n\n\n\n") 
+                if processadas > 0: sys.stdout.write("\n\n\n\n")
                 sys.stdout.flush()
-                print(f"  ✓ {nome} concluído: {processadas:,} novas páginas em {time.time() - inicio:,.0f}s.")
+                print(f"✓ {nome} concluído: {processadas:,} novas páginas em {time.time() - inicio:,.0f}s.")
             except (OSError, EOFError) as e:
                 # Trata erros de corrupção ou fim inesperado do dump .bz2
                 conn.rollback() # Cancela o lote atual

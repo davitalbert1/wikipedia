@@ -4,6 +4,8 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+
+from limpeza import formatar_texto, eh_redirecionamento
 try:
     from lxml.etree import iterparse  # mais rápido, se disponível
     HAVE_LXML = True
@@ -15,24 +17,10 @@ PASTA_DUMPS = Path(r"D:\dump") # pasta com os .xml.bz2
 DB_PATH = Path(r"G:\wikipedia\wikipedia.db") # destino do .db
 BATCH_SIZE = 2000  # páginas por lote de inserção
 
-# formatação leve de wikitexto para texto legível
-RE_STUB = re.compile(r"\{\{[^{}]*\}\}") # {{predefinições}}
-RE_REF = re.compile(r"<ref[^>]*/>|<ref[^>]*>.*?</ref>", re.S)
-RE_TAG = re.compile(r"</?[a-z][^>\n]*>", re.I) # <html tags>
-RE_LINK = re.compile(r"\[\[(?:[^|\]]*\|)?([^\]|]+)\]\]") # [[link|texto]]
-RE_EXTURL = re.compile(r"\[(?:https?:)?//[^\s\]]+\s+([^\]]+)\]")
-RE_HDR = re.compile(r"^(={2,6})\s*(.+?)\s*\1\s*$", re.M)
-RE_WS = re.compile(r"\n{3,}|[ \t]+\n")
-
-def formatar_texto(wikitexto: str) -> str:
-    t = RE_REF.sub(" ", wikitexto)
-    t = RE_STUB.sub(" ", t)
-    t = RE_LINK.sub(r"\1", t) # [[artigo|rotulo]] -> rotulo
-    t = RE_EXTURL.sub(r"\1", t)
-    t = RE_HDR.sub(r"\n## \2", t) # == Seção == -> ## Seção
-    t = RE_TAG.sub(" ", t)
-    t = RE_WS.sub(lambda m: "\n\n" if "\n\n" in m.group(0) else "\n", t)
-    return t.strip()
+# Configurações de filtro de páginas inúteis
+IGNORAR_REDIRECIONAMENTOS = True  # Pula páginas de #REDIRECT / #REDIRECIONAMENTO
+APENAS_NAMESPACE_ARTIGOS = True   # Importa apenas namespace 0 (artigos de conteúdo)
+TAMANHO_MINIMO_TEXTO = 20         # Descarta páginas cujo texto formatado fique menor que o limite
 
 SCHEMA = """
 PRAGMA page_size = 4096;
@@ -49,8 +37,6 @@ CREATE TABLE IF NOT EXISTS paginas (
     origem TEXT NOT NULL, -- nome do arquivo .bz2 de onde veio
     texto TEXT -- wikitexto formatado (legível)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_paginas_projeto ON paginas(projeto, namespace);
-CREATE INDEX IF NOT EXISTS idx_paginas_data ON paginas(data);
 
 -- controle de progresso p/ retomar importação interrompida.
 -- ultimo_page_id: maior page_id CONFIRMADO no banco, salvo na MESMA
@@ -98,10 +84,30 @@ def paginas_do_dump(arquivo: Path):
                     pid = int((elem.findtext(P + "id") or 0))
                     titulo = elem.findtext(P + "title") or ""
                     ns = int(elem.findtext(P + "ns") or 0)
+
+                    # 1. Filtro por namespace (apenas artigos no namespace 0)
+                    if APENAS_NAMESPACE_ARTIGOS and ns != 0:
+                        elem.clear()
+                        continue
+
+                    # 2. Filtro de redirecionamento pela tag XML <redirect>
+                    if IGNORAR_REDIRECIONAMENTOS and elem.find(P + "redirect") is not None:
+                        elem.clear()
+                        continue
+
                     rev = elem.find(P + "revision")
                     texto = (rev.findtext(P + "text") if rev is not None else "") or ""
+
+                    # 3. Filtro de redirecionamento pelo wikitexto (#REDIRECT)
+                    if IGNORAR_REDIRECIONAMENTOS and eh_redirecionamento(texto):
+                        elem.clear()
+                        continue
+
                     if pid and texto.strip():
-                        yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, formatar_texto(texto)
+                        texto_limpo = formatar_texto(texto)
+                        # Só emite se restou conteúdo substancial
+                        if len(texto_limpo) >= TAMANHO_MINIMO_TEXTO:
+                            yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, texto_limpo
                     elem.clear()
                     if HAVE_LXML:
                         # Libera os irmãos anteriores já processados para não
@@ -117,6 +123,28 @@ def migrar_banco_se_necessario(cur):
     if "arquivo" in colunas and "ultimo_page_id" not in colunas:
         cur.execute("ALTER TABLE progresso ADD COLUMN ultimo_page_id INTEGER NOT NULL DEFAULT 0")
 
+def expurgar_paginas_inuteis_existentes(conn):
+    """Remove do banco páginas que foram importadas anteriormente sem filtro de limpeza."""
+    cur = conn.cursor()
+    condicoes = []
+    if APENAS_NAMESPACE_ARTIGOS:
+        condicoes.append("namespace != 0")
+    if IGNORAR_REDIRECIONAMENTOS:
+        condicoes.append("texto LIKE '#REDIRECT%' OR texto LIKE '#REDIRECIONAMENTO%'")
+
+    if not condicoes:
+        return
+
+    sql_check = f"SELECT COUNT(*) FROM paginas WHERE ({' OR '.join(condicoes)})"
+    total_inuteis = cur.execute(sql_check).fetchone()[0]
+    if total_inuteis > 0:
+        print(f"\n[LIMPEZA] Encontradas {total_inuteis:,} páginas inúteis residuais no banco.")
+        print("Removendo páginas inúteis (redirecionamentos / namespaces inválidos)...")
+        sql_delete = f"DELETE FROM paginas WHERE ({' OR '.join(condicoes)})"
+        cur.execute(sql_delete)
+        conn.commit()
+        print(f"✓ {total_inuteis:,} páginas inúteis removidas com sucesso.")
+
 def main():
     arquivos = sorted(PASTA_DUMPS.rglob("*.xml.bz2"))
     if not arquivos: sys.exit(f"Nenhum .xml.bz2 encontrado em {PASTA_DUMPS}")
@@ -127,6 +155,7 @@ def main():
     cur = conn.cursor()
     migrar_banco_se_necessario(cur)
     conn.commit()
+    expurgar_paginas_inuteis_existentes(conn)
     conn.execute("BEGIN")
 
     # Usamos INSERT OR IGNORE para que a retomada seja segura e sem duplicações

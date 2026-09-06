@@ -1,3 +1,6 @@
 todo.md
 dump
-wikipedia.db
+*.db
+*.exe
+.vscode
+__pycache__

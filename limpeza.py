@@ -81,8 +81,7 @@ def converter_wikitable(bloco: str) -> str:
             for cel in re.split(r"!!|\|\|", conteudo): linha_atual.append(cel)
             continue
         if l_strip.startswith("|"):
-            if eh_cabecalho_atual and linha_atual:
-                salvar_linha()
+            if eh_cabecalho_atual and linha_atual: salvar_linha()
             eh_cabecalho_atual = False
             conteudo = l_strip[1:]
             for cel in re.split(r"\|\|", conteudo):
@@ -138,6 +137,7 @@ def substituir_wikitables(texto: str) -> str:
         tabela_md = converter_wikitable(bloco)
         texto = texto[:inicio] + tabela_md + texto[fim:]
     return texto
+
 def processar_template(conteudo: str) -> str:
     partes = [p.strip() for p in conteudo.split("|")]
     if not partes or not partes[0]: return ""
@@ -237,8 +237,7 @@ def processar_template(conteudo: str) -> str:
     if nome in ("quote", "quotation"):
         cit = args_posicionais[0] if args_posicionais else ""
         autor = args_posicionais[1] if len(args_posicionais) > 1 else args_nomeados.get("author", "")
-        if cit and autor:
-            return f'"{cit}" — {autor}'
+        if cit and autor: return f'"{cit}" — {autor}'
         return f'"{cit}"' if cit else ""
 
     # 8. Listas
@@ -247,8 +246,7 @@ def processar_template(conteudo: str) -> str:
         return ", ".join(itens)
 
     # 9. Coordenadas
-    if nome in ("coord", "coor"):
-        return " ".join(args_posicionais[:4])
+    if nome in ("coord", "coor"): return " ".join(args_posicionais[:4])
 
     # Outros templates com 1 parâmetro de texto posicional
     if len(args_posicionais) == 1 and not args_nomeados:
@@ -299,8 +297,7 @@ def extrair_legendas_imagens(texto: str) -> str:
         legendas = []
         for p in partes[1:]:
             p_lower = p.lower()
-            if p_lower in MODIFICADORES_TECNICOS:
-                continue
+            if p_lower in MODIFICADORES_TECNICOS: continue
             if re.match(r"^(?:\d+px|\d+x\d+px|upright(?:=[\d.]+)?)$", p_lower):
                 continue
             if re.match(r"^(?:alt|link|page|class|lang)=.*", p_lower):

@@ -13,21 +13,24 @@ except ImportError:
     from xml.etree.ElementTree import iterparse
     HAVE_LXML = False
 
-PASTA_DUMPS = Path(r"D:\dump") # pasta com os .xml.bz2
-DB_PATH = Path(r"G:\wikipedia\wikipedia.db") # destino do .db
+PASTA_DUMPS = Path(r"F:\wikipedia\dump") # pasta com os .xml.bz2
+DB_PATH = Path(r"F:\wikipedia\wikipedia.db") # destino do .db
 BATCH_SIZE = 2000  # páginas por lote de inserção
 
 # Configurações de filtro de páginas inúteis
 IGNORAR_REDIRECIONAMENTOS = True  # Pula páginas de #REDIRECT / #REDIRECIONAMENTO
-APENAS_NAMESPACE_ARTIGOS = True   # Importa apenas namespace 0 (artigos de conteúdo)
-TAMANHO_MINIMO_TEXTO = 20         # Descarta páginas cujo texto formatado fique menor que o limite
+APENAS_NAMESPACE_ARTIGOS = True # Importa apenas namespace 0 (artigos de conteúdo)
+TAMANHO_MINIMO_TEXTO = 20 # Descarta páginas cujo texto formatado fique menor que o limite
 
 SCHEMA = """
 PRAGMA page_size = 4096;
-PRAGMA journal_mode = OFF;
-PRAGMA synchronous = OFF;
+-- Segurança contra corrupção do .db:
+-- WAL: grava em journal à parte e recupera automaticamente após queda de energia/crash.
+-- synchronous=FULL: fsync a cada commit (garante que o checkpoint esteja realmente no disco).
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
 PRAGMA temp_store = MEMORY;
-PRAGMA locking_mode = EXCLUSIVE;
+PRAGMA wal_autocheckpoint = 2000; -- checkpoint automático do WAL (~8MB) p/ limitar crescimento
 CREATE TABLE IF NOT EXISTS paginas (
     page_id INTEGER PRIMARY KEY, -- id oficial da página
     titulo TEXT NOT NULL,
@@ -39,8 +42,6 @@ CREATE TABLE IF NOT EXISTS paginas (
 ) WITHOUT ROWID;
 
 -- controle de progresso p/ retomar importação interrompida.
--- ultimo_page_id: maior page_id CONFIRMADO no banco, salvo na MESMA
--- transação do lote correspondente (nunca antes do COMMIT).
 CREATE TABLE IF NOT EXISTS progresso (
     arquivo TEXT PRIMARY KEY, -- nome do .bz2
     completo INTEGER NOT NULL DEFAULT 0, -- 1 = importado até o fim
@@ -118,22 +119,27 @@ def paginas_do_dump(arquivo: Path):
         # Erro de descompressão BZ2 / EOF inesperado = arquivo truncado ou corrompido.
         raise
 
+def verificar_integridade(conn):
+    resultado = conn.execute("PRAGMA quick_check").fetchone()
+    if not resultado or resultado[0] != "ok":
+        sys.exit(f"[FALHA] O banco {DB_PATH} está CORROMPIDO: {resultado}\n"
+                 "Restaure um backup ou recrie o banco antes de continuar.")
+    # Se houver WAL pendente de uma execução anterior, isso força a recuperação agora.
+    conn.execute("SELECT COUNT(*) FROM paginas").fetchone()
+
 def migrar_banco_se_necessario(cur):
     colunas = [info[1] for info in cur.execute("PRAGMA table_info(progresso)").fetchall()]
     if "arquivo" in colunas and "ultimo_page_id" not in colunas:
         cur.execute("ALTER TABLE progresso ADD COLUMN ultimo_page_id INTEGER NOT NULL DEFAULT 0")
 
 def expurgar_paginas_inuteis_existentes(conn):
-    """Remove do banco páginas que foram importadas anteriormente sem filtro de limpeza."""
     cur = conn.cursor()
     condicoes = []
-    if APENAS_NAMESPACE_ARTIGOS:
-        condicoes.append("namespace != 0")
+    if APENAS_NAMESPACE_ARTIGOS: condicoes.append("namespace != 0")
     if IGNORAR_REDIRECIONAMENTOS:
         condicoes.append("texto LIKE '#REDIRECT%' OR texto LIKE '#REDIRECIONAMENTO%'")
 
-    if not condicoes:
-        return
+    if not condicoes: return
 
     sql_check = f"SELECT COUNT(*) FROM paginas WHERE ({' OR '.join(condicoes)})"
     total_inuteis = cur.execute(sql_check).fetchone()[0]
@@ -151,7 +157,10 @@ def main():
     print(f"{len(arquivos)} dump(s) encontrado(s).")
 
     conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA)  # inclui PRAGMAs de durabilidade (WAL + synchronous=FULL)
+    # WAL persiste no arquivo, mas synchronous é por conexão: reaplica sempre.
+    conn.execute("PRAGMA synchronous = FULL")
+    verificar_integridade(conn)
     cur = conn.cursor()
     migrar_banco_se_necessario(cur)
     conn.commit()
@@ -161,7 +170,6 @@ def main():
     # Usamos INSERT OR IGNORE para que a retomada seja segura e sem duplicações
     sql_insert = ("INSERT OR IGNORE INTO paginas "
                   "(page_id, titulo, namespace, projeto, data, origem, texto) VALUES (?,?,?,?,?,?,?)")
-    sql_checkpoint = "UPDATE progresso SET ultimo_page_id=? WHERE arquivo=?"
 
     pulados = 0
     total_dumps = len(arquivos)
@@ -208,13 +216,21 @@ def main():
                 for linha in paginas_do_dump(arquivo):
                     page_id = linha[0]
                     # Ignora páginas até atingir o checkpoint
-                    if page_id <= ultimo_page_id: continue
+                    if page_id <= ultimo_page_id:
+                        existe = cur.execute(
+                            "SELECT 1 FROM paginas WHERE page_id=?", (page_id,)).fetchone()
+                        if existe:
+                            continue
+                        # Página faltante no meio: recupera inserindo normalmente.
 
                     lote.append(linha)
                     if len(lote) >= BATCH_SIZE:
                         lote_checkpoint = lote[-1][0] # O page_id do último item deste lote
                         cur.executemany(sql_insert, lote)
-                        cur.execute(sql_checkpoint, (lote_checkpoint, nome))
+                        # MAX() garante checkpoint monotônico: nunca regride,
+                        # mesmo que o lote contenha páginas faltantes recuperadas.
+                        cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
+                                    (lote_checkpoint, nome))
                         conn.commit() # Confirma as páginas e o checkpoint numa transação só
                         conn.execute("BEGIN")
 
@@ -225,7 +241,8 @@ def main():
                 if lote:
                     lote_checkpoint = lote[-1][0]
                     cur.executemany(sql_insert, lote)
-                    cur.execute(sql_checkpoint, (lote_checkpoint, nome))
+                    cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
+                                (lote_checkpoint, nome))
                     processadas += len(lote)
 
                 # Marca arquivo como concluído
@@ -275,8 +292,15 @@ def main():
 
         print("\nExecutando VACUUM... (Isso pode demorar um pouco)")
         conn.execute("VACUUM")
+        # Verificação final de integridade: garante que o .db não foi corrompido.
+        print("Verificando integridade final do banco...")
+        check = conn.execute("PRAGMA quick_check").fetchone()
         conn.close()
-        print(f"Concluído: {DB_PATH}")
+        if check and check[0] == "ok":
+            print(f"Concluído: {DB_PATH} (integridade OK)")
+        else:
+            print(f"[FALHA] Integridade do banco comprometida: {check}")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

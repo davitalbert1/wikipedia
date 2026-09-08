@@ -6,3 +6,4 @@ dump
 __pycache__
 wikipedia.db-shm
 wikipedia.db-wal
+wikipedia_downloads

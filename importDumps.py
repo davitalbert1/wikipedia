@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from limpeza import formatar_texto, eh_redirecionamento
+from limpeza import formatar_texto, eh_redirecionamento, extrair_categorias, extrair_links
 try:
     from lxml.etree import iterparse  # mais rápido, se disponível
     HAVE_LXML = True
@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS progresso (
     completo INTEGER NOT NULL DEFAULT 0, -- 1 = importado até o fim
     ultimo_page_id INTEGER NOT NULL DEFAULT 0 -- checkpoint de retomada
 ) WITHOUT ROWID;
+
+-- Tabela de categorias extraídas das páginas
+CREATE TABLE IF NOT EXISTS categorias (
+    page_id INTEGER NOT NULL,
+    categoria TEXT NOT NULL,
+    FOREIGN KEY (page_id) REFERENCES paginas(page_id)
+);
+CREATE INDEX IF NOT EXISTS idx_categorias_page ON categorias(page_id);
+CREATE INDEX IF NOT EXISTS idx_categorias_nome ON categorias(categoria);
+
+-- Tabela de links internos extraídos das páginas
+CREATE TABLE IF NOT EXISTS links (
+    page_id INTEGER NOT NULL,
+    destino TEXT NOT NULL,
+    FOREIGN KEY (page_id) REFERENCES paginas(page_id)
+);
+CREATE INDEX IF NOT EXISTS idx_links_page ON links(page_id);
+CREATE INDEX IF NOT EXISTS idx_links_destino ON links(destino);
 """
 
 RE_DATA = re.compile(r"-(\d{4}-\d{2}-\d{2})-")
@@ -106,9 +124,12 @@ def paginas_do_dump(arquivo: Path):
 
                     if pid and texto.strip():
                         texto_limpo = formatar_texto(texto)
+                        # Extrai categorias e links do wikitexto original antes de limpar
+                        categorias = extrair_categorias(texto)
+                        links = extrair_links(texto)
                         # Só emite se restou conteúdo substancial
                         if len(texto_limpo) >= TAMANHO_MINIMO_TEXTO:
-                            yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, texto_limpo
+                            yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, texto_limpo, categorias, links
                     elem.clear()
                     if HAVE_LXML:
                         # Libera os irmãos anteriores já processados para não
@@ -170,6 +191,8 @@ def main():
     # Usamos INSERT OR IGNORE para que a retomada seja segura e sem duplicações
     sql_insert = ("INSERT OR IGNORE INTO paginas "
                   "(page_id, titulo, namespace, projeto, data, origem, texto) VALUES (?,?,?,?,?,?,?)")
+    sql_insert_categoria = "INSERT OR IGNORE INTO categorias (page_id, categoria) VALUES (?,?)"
+    sql_insert_link = "INSERT OR IGNORE INTO links (page_id, destino) VALUES (?,?)"
 
     pulados = 0
     total_dumps = len(arquivos)
@@ -226,7 +249,17 @@ def main():
                     lote.append(linha)
                     if len(lote) >= BATCH_SIZE:
                         lote_checkpoint = lote[-1][0] # O page_id do último item deste lote
-                        cur.executemany(sql_insert, lote)
+                        # Insere páginas
+                        cur.executemany(sql_insert, [l[:7] for l in lote])
+                        # Insere categorias e links
+                        for l in lote:
+                            page_id_l = l[0]
+                            categorias_l = l[7] if len(l) > 7 else []
+                            links_l = l[8] if len(l) > 8 else []
+                            if categorias_l:
+                                cur.executemany(sql_insert_categoria, [(page_id_l, c) for c in categorias_l])
+                            if links_l:
+                                cur.executemany(sql_insert_link, [(page_id_l, lk) for lk in links_l])
                         # MAX() garante checkpoint monotônico: nunca regride,
                         # mesmo que o lote contenha páginas faltantes recuperadas.
                         cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
@@ -240,7 +273,17 @@ def main():
 
                 if lote:
                     lote_checkpoint = lote[-1][0]
-                    cur.executemany(sql_insert, lote)
+                    # Insere páginas
+                    cur.executemany(sql_insert, [l[:7] for l in lote])
+                    # Insere categorias e links
+                    for l in lote:
+                        page_id_l = l[0]
+                        categorias_l = l[7] if len(l) > 7 else []
+                        links_l = l[8] if len(l) > 8 else []
+                        if categorias_l:
+                            cur.executemany(sql_insert_categoria, [(page_id_l, c) for c in categorias_l])
+                        if links_l:
+                            cur.executemany(sql_insert_link, [(page_id_l, lk) for lk in links_l])
                     cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
                                 (lote_checkpoint, nome))
                     processadas += len(lote)

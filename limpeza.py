@@ -249,8 +249,7 @@ def processar_template(conteudo: str) -> str:
     if nome in ("coord", "coor"): return " ".join(args_posicionais[:4])
 
     # Outros templates com 1 parâmetro de texto posicional
-    if len(args_posicionais) == 1 and not args_nomeados:
-        return args_posicionais[0]
+    if len(args_posicionais) == 1 and not args_nomeados: return args_posicionais[0]
 
     return ""
 
@@ -385,13 +384,8 @@ def formatar_texto(wikitexto: str) -> str:
     t = RE_TAG_NOWIKI.sub(r"\1", t)
     t = RE_TAG_GENERICA.sub(" ", t)
 
-    # 4. Tabelas Wikitext -> Markdown
     t = substituir_wikitables(t)
-
-    # 5. Templates e Predefinições
     t = resolver_templates(t)
-
-    # 6. Imagens e Arquivos (preserva legendas úteis)
     t = extrair_legendas_imagens(t)
 
     # 7. Categorias
@@ -429,30 +423,24 @@ def formatar_texto(wikitexto: str) -> str:
     # 14. Anexar categorias organizadas no final do texto
     if categorias:
         cats_limpas = [c.strip() for c in categorias if c.strip()]
-        if cats_limpas:
-            t = t.rstrip() + "\n\nCategorias: " + ", ".join(cats_limpas)
+        if cats_limpas: t = t.rstrip() + "\n\nCategorias: " + ", ".join(cats_limpas)
 
     # 15. Normalização de espaçamento
     t = re.sub(r"[ \t]+$", "", t, flags=re.M)
     t = re.sub(r"\n{3,}", "\n\n", t)
 
     return t.strip()
-def eh_pagina_util(
-    titulo: str,
-    namespace: int,
-    wikitexto: str,
-    apenas_artigos: bool = True,
-    filtrar_redirecionamentos: bool = True,
-    tamanho_minimo: int = 20,
-) -> bool:
-    if not titulo or not wikitexto: return False
-    if apenas_artigos and namespace != 0: return False
-    if filtrar_redirecionamentos and eh_redirecionamento(wikitexto):
-        return False
 
-    # Verificação rápida se o texto bruto é puramente um redirect disfarçado
-    texto_inicio = wikitexto.lstrip()[:100].upper()
-    if filtrar_redirecionamentos and ("#REDIRECT" in texto_inicio or "#REDIRECIONAMENTO" in texto_inicio):
-        return False
+def extrair_categorias(wikitexto: str) -> list:
+    if not wikitexto: return []
+    categorias = RE_CATEGORIA.findall(wikitexto)
+    return [c.strip() for c in categorias if c.strip()]
 
-    return True
+def extrair_links(wikitexto: str) -> list:
+    """Extrai links internos do wikitexto. Retorna lista de destinos dos links (excluindo categorias)."""
+    if not wikitexto:
+        return []
+    # Regex para capturar o destino do link (antes do |)
+    links = re.findall(r"\[\[([^|\]]+)(?:\|[^\]]*)?\]\]", wikitexto)
+    # Filtra links que são categorias
+    return [l.strip() for l in links if l.strip() and not re.match(r"(Category|Categoria):", l.strip(), re.IGNORECASE)]

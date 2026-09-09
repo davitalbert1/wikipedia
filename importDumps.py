@@ -1,3 +1,4 @@
+import argparse
 import bz2
 import re
 import sqlite3
@@ -13,8 +14,9 @@ except ImportError:
     from xml.etree.ElementTree import iterparse
     HAVE_LXML = False
 
+limpar = False
 PASTA_DUMPS = Path(r"F:\wikipedia\dump") # pasta com os .xml.bz2
-DB_PATH = Path(r"F:\wikipedia\wikipedia.db") # destino do .db
+DB_PATH = Path(r"G:\wikipedia.db") # destino do .db
 BATCH_SIZE = 2000  # páginas por lote de inserção
 
 # Configurações de filtro de páginas inúteis
@@ -22,15 +24,7 @@ IGNORAR_REDIRECIONAMENTOS = True  # Pula páginas de #REDIRECT / #REDIRECIONAMEN
 APENAS_NAMESPACE_ARTIGOS = True # Importa apenas namespace 0 (artigos de conteúdo)
 TAMANHO_MINIMO_TEXTO = 20 # Descarta páginas cujo texto formatado fique menor que o limite
 
-SCHEMA = """
-PRAGMA page_size = 4096;
--- Segurança contra corrupção do .db:
--- WAL: grava em journal à parte e recupera automaticamente após queda de energia/crash.
--- synchronous=FULL: fsync a cada commit (garante que o checkpoint esteja realmente no disco).
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
-PRAGMA temp_store = MEMORY;
-PRAGMA wal_autocheckpoint = 2000; -- checkpoint automático do WAL (~8MB) p/ limitar crescimento
+SCHEMA_BASE = """
 CREATE TABLE IF NOT EXISTS paginas (
     page_id INTEGER PRIMARY KEY, -- id oficial da página
     titulo TEXT NOT NULL,
@@ -54,8 +48,6 @@ CREATE TABLE IF NOT EXISTS categorias (
     categoria TEXT NOT NULL,
     FOREIGN KEY (page_id) REFERENCES paginas(page_id)
 );
-CREATE INDEX IF NOT EXISTS idx_categorias_page ON categorias(page_id);
-CREATE INDEX IF NOT EXISTS idx_categorias_nome ON categorias(categoria);
 
 -- Tabela de links internos extraídos das páginas
 CREATE TABLE IF NOT EXISTS links (
@@ -63,6 +55,11 @@ CREATE TABLE IF NOT EXISTS links (
     destino TEXT NOT NULL,
     FOREIGN KEY (page_id) REFERENCES paginas(page_id)
 );
+"""
+
+SCHEMA_INDICES = """
+CREATE INDEX IF NOT EXISTS idx_categorias_page ON categorias(page_id);
+CREATE INDEX IF NOT EXISTS idx_categorias_nome ON categorias(categoria);
 CREATE INDEX IF NOT EXISTS idx_links_page ON links(page_id);
 CREATE INDEX IF NOT EXISTS idx_links_destino ON links(destino);
 """
@@ -134,36 +131,54 @@ def paginas_do_dump(arquivo: Path):
                     if HAVE_LXML:
                         # Libera os irmãos anteriores já processados para não
                         # acumular milhões de elementos vazios em dumps gigantes.
-                        while elem.getprevious() is not None:
-                            del elem.getparent()[0]
+                        while elem.getprevious() is not None: del elem.getparent()[0]
     except (OSError, EOFError):
         # Erro de descompressão BZ2 / EOF inesperado = arquivo truncado ou corrompido.
         raise
 
-def verificar_integridade(conn):
-    resultado = conn.execute("PRAGMA quick_check").fetchone()
+def verificar_integridade(conn, completa=False):
+    if completa:
+        resultado = conn.execute("PRAGMA quick_check").fetchone()
+    else:
+        # Checagem leve: só lê o cabeçalho (1 página).
+        # quick_check varre o .db inteiro (GBs) — use --check p/ forçar.
+        resultado = conn.execute("PRAGMA integrity_check(1)").fetchone()
     if not resultado or resultado[0] != "ok":
         sys.exit(f"[FALHA] O banco {DB_PATH} está CORROMPIDO: {resultado}\n"
                  "Restaure um backup ou recrie o banco antes de continuar.")
-    # Se houver WAL pendente de uma execução anterior, isso força a recuperação agora.
-    conn.execute("SELECT COUNT(*) FROM paginas").fetchone()
+    # NÃO fazer SELECT COUNT(*) aqui: varre a tabela inteira só p/ contar.
 
 def migrar_banco_se_necessario(cur):
     colunas = [info[1] for info in cur.execute("PRAGMA table_info(progresso)").fetchall()]
     if "arquivo" in colunas and "ultimo_page_id" not in colunas:
         cur.execute("ALTER TABLE progresso ADD COLUMN ultimo_page_id INTEGER NOT NULL DEFAULT 0")
 
-def expurgar_paginas_inuteis_existentes(conn):
+def expurgar_paginas_inuteis_existentes(conn, forcar=False):
+    # LENTO: DELETE + COUNT com LIKE '%...' varrem a coluna `texto`
+    # inteira (GBs) no disco. Só roda com --limpar. Sem a flag,
+    # faz apenas um probe barato com EXISTS + LIMIT 1.
     cur = conn.cursor()
     condicoes = []
     if APENAS_NAMESPACE_ARTIGOS: condicoes.append("namespace != 0")
     if IGNORAR_REDIRECIONAMENTOS:
         condicoes.append("texto LIKE '#REDIRECT%' OR texto LIKE '#REDIRECIONAMENTO%'")
 
-    if not condicoes: return
+    if not condicoes: return 0
 
-    sql_check = f"SELECT COUNT(*) FROM paginas WHERE ({' OR '.join(condicoes)})"
-    total_inuteis = cur.execute(sql_check).fetchone()[0]
+    if not forcar:
+        # Probe barato: EXISTS para por 1 linha, sem COUNT(*) na coluna texto.
+        # Roda a limpeza pesada só com --limpar.
+        probe = cur.execute(
+            f"SELECT EXISTS(SELECT 1 FROM paginas WHERE ({' OR '.join(condicoes)}) LIMIT 1)"
+        ).fetchone()[0]
+        if probe:
+            print("\n[AVISO] Há páginas inúteis residuais no banco (probe EXISTS=1).")
+            print("Rode com --limpar para remover (operação lenta, varre o disco).")
+        return 0
+
+    total_inuteis = cur.execute(
+        f"SELECT COUNT(*) FROM paginas WHERE ({' OR '.join(condicoes)})"
+    ).fetchone()[0]
     if total_inuteis > 0:
         print(f"\n[LIMPEZA] Encontradas {total_inuteis:,} páginas inúteis residuais no banco.")
         print("Removendo páginas inúteis (redirecionamentos / namespaces inválidos)...")
@@ -172,21 +187,98 @@ def expurgar_paginas_inuteis_existentes(conn):
         conn.commit()
         print(f"✓ {total_inuteis:,} páginas inúteis removidas com sucesso.")
 
+def montar_lotes_otimizado(it_paginas, batch_size=BATCH_SIZE):
+    lote_principal = []
+    categorias_flat = []
+    links_flat = []
+    cnt = 0
+
+    for pag in it_paginas:
+        page_id, titulo, ns, projeto, data, origem, texto_limpo, categorias, links = pag
+        lote_principal.append([page_id, titulo, ns, projeto, data, origem, texto_limpo])
+        if categorias: categorias_flat.extend((page_id, c) for c in categorias)
+        if links: links_flat.extend((page_id, lk) for lk in links)
+        cnt += 1
+        if cnt >= batch_size:
+            yield lote_principal, categorias_flat, links_flat, page_id
+            lote_principal = []
+            categorias_flat = []
+            links_flat = []
+            cnt = 0
+    if lote_principal: yield lote_principal, categorias_flat, links_flat, page_id
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Importa dumps .xml.bz2 p/ SQLite com retomada rápida.")
+    ap.add_argument("--check", action="store_true",
+                    help="Roda PRAGMA quick_check completo (lento, varre o .db). Padrão é checagem leve de 1 página.")
+    ap.add_argument("--limpar", action="store_true",
+                    help="Remove páginas inúteis residuais (DELETE com LIKE varre GBs; sem a flag só avisa via EXISTS).")
+    ap.add_argument("--vacuum", action="store_true",
+                    help="Roda VACUUM no fim (lento, reescreve o .db). Padrão: pula.")
+    ap.add_argument("--status", action="store_true",
+                    help="Só mostra o que falta (lê apenas a tabela progresso, sem tocar nos .bz2 nem no texto).")
+    ap.add_argument("--batch", type=int, default=BATCH_SIZE, help="Páginas por commit.")
+    return ap.parse_args()
+
+def mostrar_status(arquivos, conn):
+    # RÁPIDO: 1 SELECT pequeno na tabela progresso + stat dos arquivos.
+    # Não abre .bz2, não conta paginas, não lê coluna texto.
+    cur = conn.cursor()
+    try:
+        rows = cur.execute("SELECT arquivo, completo, ultimo_page_id FROM progresso").fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # banco novo, sem tabela ainda
+    prog = {r[0]: (r[1], r[2]) for r in rows}
+    print(f"\n{'ARQUIVO':55s} {'ESTADO':22s} {'CHECKPOINT'}")
+    for arq in arquivos:
+        nome = arq.name
+        st = prog.get(nome)
+        if st and st[0]:
+            estado = "✓ completo (pula)"
+        elif st:
+            estado = f"→ retomar de {st[1]:,}"
+        else:
+            estado = "○ novo (a importar)"
+        print(f"{nome:55s} {estado:22s} {st[1] if st else 0:,}")
+    n_ok = sum(1 for _, (c, _) in prog.items() if c)
+    print(f"\n{n_ok}/{len(arquivos)} completos. Faltam {len(arquivos) - n_ok}.\n")
+
+
 def main():
+    args = parse_args()
+    batch_size = max(100, args.batch)
     arquivos = sorted(PASTA_DUMPS.rglob("*.xml.bz2"))
     if not arquivos: sys.exit(f"Nenhum .xml.bz2 encontrado em {PASTA_DUMPS}")
-    print(f"{len(arquivos)} dump(s) encontrado(s).")
+    print(f"{len(arquivos)} dump(s) encontrado(s).", flush=True)
+    t_db0 = time.time()
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)  # inclui PRAGMAs de durabilidade (WAL + synchronous=FULL)
-    # WAL persiste no arquivo, mas synchronous é por conexão: reaplica sempre.
-    conn.execute("PRAGMA synchronous = FULL")
-    verificar_integridade(conn)
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    # PRAGMAs de escrita rápida p/ bulk load (restaura FULL no fim).
+    # page_size só vale p/ banco novo e exige VACUUM; tenta sem falhar.
+    try: conn.execute("PRAGMA page_size = 4096")
+    except sqlite3.DatabaseError: pass
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -262144")  # ~256 MB de cache
+    conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+    conn.executescript(SCHEMA_BASE)
+    conn.executescript(SCHEMA_INDICES)
+    verificar_integridade(conn, completa=args.check)
     cur = conn.cursor()
     migrar_banco_se_necessario(cur)
     conn.commit()
-    expurgar_paginas_inuteis_existentes(conn)
-    conn.execute("BEGIN")
+    print(f"[DB] pronto em {time.time() - t_db0:.1f}s.", flush=True)
+
+    if args.status:
+        mostrar_status(arquivos, conn)
+        conn.close()
+        return
+
+    if limpar:
+        expurgar_paginas_inuteis_existentes(conn, forcar=args.limpar)
+    # Sem BEGIN manual: sqlite3 abre/commita por statement; BEGIN solto
+    # aqui quebrava os conn.commit() seguintes ("no transaction is active").
 
     # Usamos INSERT OR IGNORE para que a retomada seja segura e sem duplicações
     sql_insert = ("INSERT OR IGNORE INTO paginas "
@@ -198,17 +290,17 @@ def main():
     total_dumps = len(arquivos)
     inicio = time.time()
 
-    def mostrar_progresso(indice: int, nome_atual: str, processadas: int, checkpoint: int, is_final=False):
-        total_db = cur.execute("SELECT COUNT(*) FROM paginas").fetchone()[0]
+    # Contador barato p/ o progresso (sem COUNT(*) que varre o disco).
+    total_inserido = 0
+
+    def mostrar_progresso(indice, nome_atual, processadas, checkpoint):
         pct = (indice - 1) / total_dumps * 100
         vel = processadas / max(time.time() - inicio, 1e-9)
-
-        # ANSI para limpar linhas
-        texto_limpo = f"\r[{indice}/{total_dumps} dumps | {pct:5.1f}%] {nome_atual}:"
-        if not is_final:
-            texto_limpo += f"\n  {processadas:,} páginas processadas\n  checkpoint: {checkpoint:,}\n  velocidade: {vel:,.0f} pág/s\n  total no DB: {total_db:,}\033[4A"
-
-        sys.stdout.write(texto_limpo)
+        sys.stdout.write(
+            f"\r[{indice}/{total_dumps} | {pct:5.1f}%] {nome_atual}: "
+            f"{processadas:,} neste dump | checkpoint {checkpoint:,} | "
+            f"{vel:,.0f} pag/s | +{total_inserido:,} nesta sessao"
+        )
         sys.stdout.flush()
 
     try:
@@ -229,80 +321,59 @@ def main():
                 print(f"\n> {nome}")
                 cur.execute("INSERT OR IGNORE INTO progresso (arquivo, completo, ultimo_page_id) VALUES (?,0,0)", (nome,))
                 conn.commit()
-                conn.execute("BEGIN")
 
-            lote, processadas = [], 0
-            # Guardamos o último page_id de cada lote para ser comitado de forma segura
+            processadas = 0
+            ignoradas = 0
             lote_checkpoint = ultimo_page_id
+            ja_vistos = None
+            if ultimo_page_id:
+                # Pula o que já está no banco SEM reparsear tudo de novo
+                # na próxima vez: carrega os ids já gravados deste dump
+                # (só coluna origem+page_id, 1 passada, sem ler texto).
+                ja_vistos = {r[0] for r in cur.execute(
+                    "SELECT page_id FROM paginas WHERE origem=?", (nome,))}
+                print(f"  ({len(ja_vistos):,} paginas deste dump ja no banco — serao puladas sem regravar)")
+            it_paginas = paginas_do_dump(arquivo)
+            lotes = montar_lotes_otimizado(it_paginas, batch_size=batch_size)
 
             try:
-                for linha in paginas_do_dump(arquivo):
-                    page_id = linha[0]
-                    # Ignora páginas até atingir o checkpoint
-                    if page_id <= ultimo_page_id:
-                        existe = cur.execute(
-                            "SELECT 1 FROM paginas WHERE page_id=?", (page_id,)).fetchone()
-                        if existe:
-                            continue
-                        # Página faltante no meio: recupera inserindo normalmente.
+                for lote_principal, categorias_flat, links_flat, ultimo_page_id_lote in lotes:
+                    if ja_vistos is not None:
+                        # Filtra o lote em memória (rápido); se sobrar nada,
+                        # só avança o checkpoint sem INSERT nem commit.
+                        lote_principal = [r for r in lote_principal if r[0] not in ja_vistos]
+                        if categorias_flat:
+                            categorias_flat = [c for c in categorias_flat if c[0] not in ja_vistos]
+                        if links_flat:
+                            links_flat = [lk for lk in links_flat if lk[0] not in ja_vistos]
+                        ignoradas += (batch_size - len(lote_principal)) if lote_principal else 0
+                    lote_checkpoint = ultimo_page_id_lote
 
-                    lote.append(linha)
-                    if len(lote) >= BATCH_SIZE:
-                        lote_checkpoint = lote[-1][0] # O page_id do último item deste lote
-                        # Insere páginas
-                        cur.executemany(sql_insert, [l[:7] for l in lote])
-                        # Insere categorias e links
-                        for l in lote:
-                            page_id_l = l[0]
-                            categorias_l = l[7] if len(l) > 7 else []
-                            links_l = l[8] if len(l) > 8 else []
-                            if categorias_l:
-                                cur.executemany(sql_insert_categoria, [(page_id_l, c) for c in categorias_l])
-                            if links_l:
-                                cur.executemany(sql_insert_link, [(page_id_l, lk) for lk in links_l])
-                        # MAX() garante checkpoint monotônico: nunca regride,
-                        # mesmo que o lote contenha páginas faltantes recuperadas.
-                        cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
-                                    (lote_checkpoint, nome))
-                        conn.commit() # Confirma as páginas e o checkpoint numa transação só
-                        conn.execute("BEGIN")
+                    if lote_principal:
+                        cur.executemany(sql_insert, lote_principal)
+                        if categorias_flat:
+                            cur.executemany(sql_insert_categoria, categorias_flat)
+                        if links_flat:
+                            cur.executemany(sql_insert_link, links_flat)
+                        total_inserido += len(lote_principal)
 
-                        processadas += len(lote)
-                        lote.clear()
-                        mostrar_progresso(indice, nome, processadas, lote_checkpoint)
-
-                if lote:
-                    lote_checkpoint = lote[-1][0]
-                    # Insere páginas
-                    cur.executemany(sql_insert, [l[:7] for l in lote])
-                    # Insere categorias e links
-                    for l in lote:
-                        page_id_l = l[0]
-                        categorias_l = l[7] if len(l) > 7 else []
-                        links_l = l[8] if len(l) > 8 else []
-                        if categorias_l:
-                            cur.executemany(sql_insert_categoria, [(page_id_l, c) for c in categorias_l])
-                        if links_l:
-                            cur.executemany(sql_insert_link, [(page_id_l, lk) for lk in links_l])
                     cur.execute("UPDATE progresso SET ultimo_page_id=MAX(ultimo_page_id,?) WHERE arquivo=?",
                                 (lote_checkpoint, nome))
-                    processadas += len(lote)
+                    conn.commit()
 
-                # Marca arquivo como concluído
+                    processadas += len(lote_principal)
+
+                    mostrar_progresso(indice, nome, processadas, lote_checkpoint)
+
+                # Marca arquivo como concluído (1x só)
                 cur.execute("UPDATE progresso SET completo=1 WHERE arquivo=?", (nome,))
                 conn.commit()
-                conn.execute("BEGIN")
 
-                # Move o cursor de terminal para baixo das 4 linhas do progresso
-                if processadas > 0: sys.stdout.write("\n\n\n\n")
-                sys.stdout.flush()
-                print(f"✓ {nome} concluído: {processadas:,} novas páginas em {time.time() - inicio:,.0f}s.")
+                print(f"\n✓ {nome} concluído: {processadas:,} novas páginas "
+                      f"({ignoradas:,} já existiam) em {time.time() - inicio:,.0f}s.")
             except (OSError, EOFError) as e:
                 # Trata erros de corrupção ou fim inesperado do dump .bz2
                 conn.rollback() # Cancela o lote atual
-                conn.execute("BEGIN")
-                if processadas > 0: sys.stdout.write("\n\n\n\n")
-                sys.stdout.flush()
                 print(f"\n[ERRO] O dump {nome} parece estar truncado ou corrompido.")
                 print(f"Progresso salvo até o checkpoint: {lote_checkpoint:,}")
                 print(f"Detalhe: {e}")
@@ -310,21 +381,14 @@ def main():
                 break
             except Exception as e:
                 conn.rollback()
-                conn.execute("BEGIN")
-                if processadas > 0: sys.stdout.write("\n\n\n\n")
-                sys.stdout.flush()
                 print(f"\n[ERRO] Erro inesperado ao processar {nome}: {e}")
                 raise
     except KeyboardInterrupt:
-        if 'processadas' in locals() and processadas > 0: sys.stdout.write("\n\n\n\n")
-        sys.stdout.flush()
         print("\n[AVISO] Interrupção (Ctrl+C) detectada!")
         print("Fazendo rollback do lote atual para preservar a integridade...")
         conn.rollback() # Limpa as páginas do lote atual que não foram comitadas com o checkpoint
         print("Pode executar o script novamente para continuar de onde parou.")
     except Exception as e:
-        sys.stdout.write("\n\n\n\n")
-        sys.stdout.flush()
         print("\n[AVISO] Erro fatal detectado. Rollback do lote atual.")
         conn.rollback()
         raise
@@ -332,12 +396,18 @@ def main():
         # Só garantimos um commit final das outras coisas se estiver numa transação ativa
         if conn.in_transaction: conn.commit()
         if pulados: print(f"\n{pulados} dump(s) já completos foram pulados.")
+        print(f"\nSessão: +{total_inserido:,} páginas em {time.time() - inicio:,.0f}s.")
 
-        print("\nExecutando VACUUM... (Isso pode demorar um pouco)")
-        conn.execute("VACUUM")
-        # Verificação final de integridade: garante que o .db não foi corrompido.
+        conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("PRAGMA locking_mode = NORMAL")
+        if args.vacuum:
+            print("\nExecutando VACUUM... (pode demorar)")
+            conn.execute("VACUUM")
+        else:
+            print("\nVACUUM pulado (use --vacuum para forçar).")
+        # Verificação final leve de integridade.
         print("Verificando integridade final do banco...")
-        check = conn.execute("PRAGMA quick_check").fetchone()
+        check = conn.execute("PRAGMA integrity_check(1)").fetchone()
         conn.close()
         if check and check[0] == "ok":
             print(f"Concluído: {DB_PATH} (integridade OK)")

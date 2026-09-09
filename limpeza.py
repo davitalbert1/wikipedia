@@ -7,21 +7,44 @@ RE_REDIRECT = re.compile(
     re.IGNORECASE
 )
 
-# Comentários e referências
-RE_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-RE_REF = re.compile(r"<ref[^>]*/>|<ref[^>]*>.*?</ref>", re.DOTALL | re.IGNORECASE)
-RE_REFLIST = re.compile(
-    r"<(?:references|gallery)[^>]*/>|<(?:references|gallery)[^>]*>.*?</(?:references|gallery)>",
-    re.DOTALL | re.IGNORECASE
+# Comentários, referências e reflists numa ÚNICA passada (todos viram " ").
+# Menos varreduras do texto inteiro = menos CPU por página (formatar_texto
+# roda milhões de vezes sobre o dump todo).
+RE_LIXO_XML = re.compile(
+    r"<!--.*?-->"
+    r"|<ref[^>]*/>"
+    r"|<ref[^>]*>.*?</ref>"
+    r"|<(?:references|gallery)[^>]*/>"
+    r"|<(?:references|gallery)[^>]*>.*?</(?:references|gallery)>",
+    re.DOTALL | re.IGNORECASE,
 )
 
-# Tags HTML de formatação
-RE_TAG_BR = re.compile(r"<(?:br|hr)\s*/?>", re.IGNORECASE)
-RE_TAG_ESTILO = re.compile(r"<(?:b|strong)[^>]*>(.*?)</(?:b|strong)>", re.IGNORECASE | re.DOTALL)
-RE_TAG_ITALIC = re.compile(r"<(?:i|em)[^>]*>(.*?)</(?:i|em)>", re.IGNORECASE | re.DOTALL)
-RE_TAG_CODE = re.compile(r"<(?:code|tt)[^>]*>(.*?)</(?:code|tt)>", re.IGNORECASE | re.DOTALL)
-RE_TAG_MATH = re.compile(r"<(?:math|chem)[^>]*>(.*?)</(?:math|chem)>", re.IGNORECASE | re.DOTALL)
-RE_TAG_NOWIKI = re.compile(r"<nowiki>(.*?)</nowiki>", re.IGNORECASE | re.DOTALL)
+# Tags de formatação inline + br/hr numa ÚNICA passada (em vez de 6 sub()).
+RE_TAG_FORMATACAO = re.compile(
+    r"<(b|strong|i|em|code|tt|math|chem|nowiki)[^>]*>(.*?)</\1\s*>"
+    r"|<(?:br|hr)\s*/?>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _sub_tag_formatacao(m):
+    if m.group(1) is None:  # <br>/<hr> → quebra de linha
+        return "\n"
+    nome = m.group(1).lower()
+    conteudo = m.group(2)
+    if nome in ("b", "strong"): return f"**{conteudo}**"
+    if nome in ("i", "em"): return f"*{conteudo}*"
+    if nome in ("code", "tt"): return f"`{conteudo}`"
+    return conteudo  # math, chem, nowiki mantêm o conteúdo puro
+
+# Negrito/itálico do wikitexto ('' / ''' / ''''') numa única passada
+# em vez de 3: 5 aspas → ***x***, 3 → **x**, 2 → *x*.
+RE_ASPAS_WIKI = re.compile(r"('{2,5})(.+?)'{2,5}", re.DOTALL)
+
+def _sub_aspas(m):
+    n = len(m.group(1))
+    marcador = "***" if n >= 5 else ("**" if n == 3 else "*")
+    return f"{marcador}{m.group(2)}{marcador}"
+
 RE_TAG_GENERICA = re.compile(r"</?[a-z][^>\n]*>", re.IGNORECASE)
 
 # Links e categorias
@@ -368,20 +391,11 @@ def formatar_texto(wikitexto: str) -> str:
 
     t = wikitexto
 
-    # 1. Comentários HTML
-    t = RE_COMMENT.sub(" ", t)
+    # 1-2. Comentários, refs e reflists numa única passada
+    t = RE_LIXO_XML.sub(" ", t)
 
-    # 2. Tags de referências e citações de rodapé
-    t = RE_REF.sub(" ", t)
-    t = RE_REFLIST.sub(" ", t)
-
-    # 3. Tags HTML de formatação inline
-    t = RE_TAG_BR.sub("\n", t)
-    t = RE_TAG_ESTILO.sub(r"**\1**", t)
-    t = RE_TAG_ITALIC.sub(r"*\1*", t)
-    t = RE_TAG_CODE.sub(r"`\1`", t)
-    t = RE_TAG_MATH.sub(r"\1", t)
-    t = RE_TAG_NOWIKI.sub(r"\1", t)
+    # 3. Tags HTML de formatação inline + br/hr numa única passada
+    t = RE_TAG_FORMATACAO.sub(_sub_tag_formatacao, t)
     t = RE_TAG_GENERICA.sub(" ", t)
 
     t = substituir_wikitables(t)
@@ -404,10 +418,8 @@ def formatar_texto(wikitexto: str) -> str:
         return f"\n{prefixo} {m.group(2).strip()}\n"
     t = RE_CABECALHO.sub(ajustar_cabecalho, t)
 
-    # 10. Formatação de negrito e itálico do wikitexto
-    t = re.sub(r"'{5}(.+?)'{5}", r"***\1***", t)
-    t = re.sub(r"'{3}(.+?)'{3}", r"**\1**", t)
-    t = re.sub(r"'{2}(.+?)'{2}", r"*\1*", t)
+    # 10. Negrito/itálico do wikitexto numa única passada
+    t = RE_ASPAS_WIKI.sub(_sub_aspas, t)
 
     # 11. Decodificação de entidades HTML (&nbsp;, &ndash;, etc.)
     t = html.unescape(t)

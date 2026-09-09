@@ -16,8 +16,8 @@ except ImportError:
 
 limpar = False
 PASTA_DUMPS = Path(r"F:\wikipedia\dump") # pasta com os .xml.bz2
-DB_PATH = Path(r"G:\wikipedia.db") # destino do .db
-BATCH_SIZE = 2000  # páginas por lote de inserção
+DB_PATH = Path(r"F:\wikipedia\wikipedia.db") # destino do .db
+BATCH_SIZE = 1000  # páginas por lote de inserção
 
 # Configurações de filtro de páginas inúteis
 IGNORAR_REDIRECIONAMENTOS = True  # Pula páginas de #REDIRECT / #REDIRECIONAMENTO
@@ -81,7 +81,7 @@ def detectar_tag_page(arquivo: Path) -> str:
     if m: return "{%s}page" % m.group(1).decode("ascii", "ignore")
     return "page"
 
-def paginas_do_dump(arquivo: Path):
+def paginas_do_dump(arquivo: Path, skip_ate_pid: int = 0):
     nome_projeto = arquivo.name.split("-")[0]
     DATA = data_do_arquivo(arquivo.name)
     tag_page = detectar_tag_page(arquivo)
@@ -100,6 +100,12 @@ def paginas_do_dump(arquivo: Path):
                     pid = int((elem.findtext(P + "id") or 0))
                     titulo = elem.findtext(P + "title") or ""
                     ns = int(elem.findtext(P + "ns") or 0)
+
+                    # 0. Retomada: dumps ordenam páginas por page_id, então
+                    # tudo <= checkpoint já foi importado ou filtrado antes.
+                    if pid and pid <= skip_ate_pid:
+                        elem.clear()
+                        continue
 
                     # 1. Filtro por namespace (apenas artigos no namespace 0)
                     if APENAS_NAMESPACE_ARTIGOS and ns != 0:
@@ -121,11 +127,12 @@ def paginas_do_dump(arquivo: Path):
 
                     if pid and texto.strip():
                         texto_limpo = formatar_texto(texto)
-                        # Extrai categorias e links do wikitexto original antes de limpar
-                        categorias = extrair_categorias(texto)
-                        links = extrair_links(texto)
-                        # Só emite se restou conteúdo substancial
+                        # Só emite se restou conteúdo substancial; a extração de
+                        # categorias/links (2 passadas de regex no texto inteiro)
+                        # fica DEPOIS do filtro p/ não gastar CPU nas descartadas.
                         if len(texto_limpo) >= TAMANHO_MINIMO_TEXTO:
+                            categorias = extrair_categorias(texto)
+                            links = extrair_links(texto)
                             yield pid, titulo, ns, nome_projeto, DATA, arquivo.name, texto_limpo, categorias, links
                     elem.clear()
                     if HAVE_LXML:
@@ -263,7 +270,10 @@ def main():
     conn.execute("PRAGMA cache_size = -262144")  # ~256 MB de cache
     conn.execute("PRAGMA locking_mode = EXCLUSIVE")
     conn.executescript(SCHEMA_BASE)
-    conn.executescript(SCHEMA_INDICES)
+    # Índices secundários são criados só NO FIM da sessão (no finally):
+    # mantê-los atualizados a cada insert custa caro no bulk load.
+    # IF NOT EXISTS torna a criação segura em retomadas/segunda execução.
+    conn.execute("PRAGMA mmap_size = 1073741824")  # 1 GB de arquivo mapeado p/ leitura
     verificar_integridade(conn, completa=args.check)
     cur = conn.cursor()
     migrar_banco_se_necessario(cur)
@@ -323,30 +333,14 @@ def main():
                 conn.commit()
 
             processadas = 0
-            ignoradas = 0
             lote_checkpoint = ultimo_page_id
-            ja_vistos = None
             if ultimo_page_id:
-                # Pula o que já está no banco SEM reparsear tudo de novo
-                # na próxima vez: carrega os ids já gravados deste dump
-                # (só coluna origem+page_id, 1 passada, sem ler texto).
-                ja_vistos = {r[0] for r in cur.execute(
-                    "SELECT page_id FROM paginas WHERE origem=?", (nome,))}
-                print(f"  ({len(ja_vistos):,} paginas deste dump ja no banco — serao puladas sem regravar)")
-            it_paginas = paginas_do_dump(arquivo)
+                print(f"  (paginas com page_id <= {ultimo_page_id:,} serao puladas direto no parse)")
+            it_paginas = paginas_do_dump(arquivo, skip_ate_pid=ultimo_page_id)
             lotes = montar_lotes_otimizado(it_paginas, batch_size=batch_size)
 
             try:
                 for lote_principal, categorias_flat, links_flat, ultimo_page_id_lote in lotes:
-                    if ja_vistos is not None:
-                        # Filtra o lote em memória (rápido); se sobrar nada,
-                        # só avança o checkpoint sem INSERT nem commit.
-                        lote_principal = [r for r in lote_principal if r[0] not in ja_vistos]
-                        if categorias_flat:
-                            categorias_flat = [c for c in categorias_flat if c[0] not in ja_vistos]
-                        if links_flat:
-                            links_flat = [lk for lk in links_flat if lk[0] not in ja_vistos]
-                        ignoradas += (batch_size - len(lote_principal)) if lote_principal else 0
                     lote_checkpoint = ultimo_page_id_lote
 
                     if lote_principal:
@@ -369,8 +363,9 @@ def main():
                 cur.execute("UPDATE progresso SET completo=1 WHERE arquivo=?", (nome,))
                 conn.commit()
 
-                print(f"\n✓ {nome} concluído: {processadas:,} novas páginas "
-                      f"({ignoradas:,} já existiam) em {time.time() - inicio:,.0f}s.")
+                print(f"\n✓ {nome} concluído: {processadas:,} páginas processadas "
+                      f"(duplicadas ignoradas pelo INSERT OR IGNORE) "
+                      f"em {time.time() - inicio:,.0f}s.")
             except (OSError, EOFError) as e:
                 # Trata erros de corrupção ou fim inesperado do dump .bz2
                 conn.rollback() # Cancela o lote atual
@@ -400,6 +395,11 @@ def main():
 
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA locking_mode = NORMAL")
+        print("\nCriando índices (se faltarem)...", flush=True)
+        t_idx = time.time()
+        conn.executescript(SCHEMA_INDICES)
+        conn.commit()
+        print(f"Índices prontos em {time.time() - t_idx:.1f}s.")
         if args.vacuum:
             print("\nExecutando VACUUM... (pode demorar)")
             conn.execute("VACUUM")

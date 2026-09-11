@@ -61,7 +61,9 @@ RE_TEMPLATE_FOLHA = re.compile(r"\{\{([^{}]+)\}\}")
 
 def eh_redirecionamento(texto: str) -> bool:
     if not texto: return False
-    return bool(RE_REDIRECT.match(texto.strip()))
+    trecho = texto[:100].lstrip()
+    if not trecho.startswith("#"): return False
+    return bool(RE_REDIRECT.match(trecho))
 
 def converter_wikitable(bloco: str) -> str:
     linhas = bloco.strip().splitlines()
@@ -154,11 +156,13 @@ def substituir_wikitables(texto: str) -> str:
         if nivel == 0: return t[pos_inicio:pos], pos_inicio, pos
         return None, -1, -1
 
+    search_pos = 0
     while True:
-        bloco, inicio, fim = encontrar_tabela(texto)
+        bloco, inicio, fim = encontrar_tabela(texto, search_pos)
         if not bloco: break
         tabela_md = converter_wikitable(bloco)
         texto = texto[:inicio] + tabela_md + texto[fim:]
+        search_pos = inicio + len(tabela_md)
     return texto
 
 def processar_template(conteudo: str) -> str:
@@ -386,8 +390,8 @@ def limpar_secoes_vazias(texto: str) -> str:
         i += 1
     return "\n".join(novas_linhas)
 
-def formatar_texto(wikitexto: str) -> str:
-    if not wikitexto: return ""
+def formatar_texto(wikitexto: str) -> tuple[str, list[str]]:
+    if not wikitexto: return "", []
 
     t = wikitexto
 
@@ -433,15 +437,15 @@ def formatar_texto(wikitexto: str) -> str:
     t = limpar_secoes_vazias(t)
 
     # 14. Anexar categorias organizadas no final do texto
-    if categorias:
-        cats_limpas = [c.strip() for c in categorias if c.strip()]
-        if cats_limpas: t = t.rstrip() + "\n\nCategorias: " + ", ".join(cats_limpas)
+    cats_limpas = [c.strip() for c in categorias if c.strip()]
+    if cats_limpas:
+        t = t.rstrip() + "\n\nCategorias: " + ", ".join(cats_limpas)
 
     # 15. Normalização de espaçamento
     t = re.sub(r"[ \t]+$", "", t, flags=re.M)
     t = re.sub(r"\n{3,}", "\n\n", t)
 
-    return t.strip()
+    return t.strip(), cats_limpas
 
 def extrair_categorias(wikitexto: str) -> list:
     if not wikitexto: return []

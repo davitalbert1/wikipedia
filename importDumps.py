@@ -20,7 +20,7 @@ limpar = False
 PASTA_DUMPS = Path(r"F:\wikipedia\dump") # pasta com os .xml.bz2
 DB_PATH = Path(r"F:\wikipedia\wikipedia.db") # destino do .db
 BATCH_SIZE = 20000  # páginas por lote de inserção
-WORKERS = 2
+WORKERS = 3
 
 # Configurações de filtro de páginas inúteis
 IGNORAR_REDIRECIONAMENTOS = True  # Pula páginas de #REDIRECT / #REDIRECIONAMENTO
@@ -89,7 +89,7 @@ def detectar_tag_page(arquivo: Path) -> str:
     if m: return "{%s}page" % m.group(1).decode("ascii", "ignore")
     return "page"
 
-def paginas_do_dump(arquivo: Path, skip_ate_pid: int = 0):
+def paginas_do_dump(arquivo: Path, skip_ate_pid: int = 0, existing_ids: set = None):
     nome_projeto = arquivo.name.split("-")[0]
     DATA = data_do_arquivo(arquivo.name)
     tag_page = detectar_tag_page(arquivo)
@@ -110,6 +110,15 @@ def paginas_do_dump(arquivo: Path, skip_ate_pid: int = 0):
                     ns = int(elem.findtext(P + "ns") or 0)
 
                     if pid and pid <= skip_ate_pid:
+                        elem.clear()
+
+                        if HAVE_LXML:
+                            while elem.getprevious() is not None: del elem.getparent()[0]
+
+                        continue
+
+                    # Já existe no banco — pula antes de qualquer processamento caro
+                    if existing_ids is not None and pid in existing_ids:
                         elem.clear()
 
                         if HAVE_LXML:
@@ -244,14 +253,14 @@ def montar_lotes_otimizado(it_paginas, batch_size=BATCH_SIZE):
             cnt = 0
     if lote_principal: yield lote_principal, categorias_flat, links_flat, page_id
 
-def worker_parse_dump(task_queue, result_queue, batch_size):
+def worker_parse_dump(task_queue, result_queue, batch_size, existing_ids):
     while True:
         try:
             task = task_queue.get()
             if task is None: break
             arquivo_path, skip_ate_pid = task
             nome = arquivo_path.name
-            it_paginas = paginas_do_dump(arquivo_path, skip_ate_pid=skip_ate_pid)
+            it_paginas = paginas_do_dump(arquivo_path, skip_ate_pid=skip_ate_pid, existing_ids=existing_ids)
             lotes = montar_lotes_otimizado(it_paginas, batch_size=batch_size)
             for lote_principal, categorias_flat, links_flat, checkpoint in lotes:
                 result_queue.put(("BATCH", nome, lote_principal, categorias_flat, links_flat, checkpoint, len(lote_principal)))
@@ -365,6 +374,12 @@ def main():
 
     print(f"\n{len(tarefas)} dump(s) pendentes para processar. ({pulados} já completos pulados)", flush=True)
 
+    # Carrega page_ids existentes p/ pular antes de formatar_texto/extrair_links
+    print("[DB] Carregando page_ids existentes para skip rápido...", flush=True)
+    t_ids = time.time()
+    existing_ids = frozenset(row[0] for row in cur.execute("SELECT page_id FROM paginas"))
+    print(f"[DB] {len(existing_ids):,} page_ids carregados em {time.time() - t_ids:.1f}s.", flush=True)
+
     task_queue = mp.Queue()
     result_queue = mp.Queue(maxsize=num_workers * 4)
 
@@ -373,7 +388,7 @@ def main():
 
     workers = []
     for _ in range(num_workers):
-        p = mp.Process(target=worker_parse_dump, args=(task_queue, result_queue, batch_size))
+        p = mp.Process(target=worker_parse_dump, args=(task_queue, result_queue, batch_size, existing_ids))
         p.daemon = True
         p.start()
         workers.append(p)
